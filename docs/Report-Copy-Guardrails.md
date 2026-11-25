@@ -71,7 +71,7 @@ Banned filler words, which read as machine-written: *delve, seamless, robust, ho
 
 - Logos: education brand (Chartwells) on the left, parent company (Compass Group) on the right. Use only official files, never stretched or recoloured.
 - Write "Chartwells" (one word, no apostrophe) and "Compass Group India".
-- Contact details must match the approved ones: enquiries@compassgroup-chartwells.co.in, +91 74284 58309.
+- Contact details must match the approved ones: sarika.chauhan@compass-group.co.in, +91 96671 80483.
 
 ## 9. Personal data
 

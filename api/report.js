@@ -15,6 +15,10 @@
      RESEND_API_KEY      fallback email service key (resend.com)
      REPORT_FROM         Resend sender, e.g. "Chartwells Dining Readiness <report@reports.example.com>"
      REPORT_REPLY_TO     optional reply-to address
+     SHEET_WEBHOOK_URL   optional: Google Apps Script web-app URL that adds one row per guest to the team's sheet
+     SHEET_SECRET        shared key the sheet script checks (required with SHEET_WEBHOOK_URL)
+     REPORT_TEAM_TO      optional: the Chartwells contact (comma separated) who gets one details email per guest,
+                         with name, email, phone, role, institution, scores and the PDF (REPORT_BCC is read as a fallback)
      REPORT_BASE_URL     the site's own address, e.g. https://compass-dining-readiness.vercel.app (defaults to the Vercel production URL)
      ALLOWED_ORIGINS     extra sites allowed to send reports, comma separated (the site itself is always allowed)
      EVENT_KEY           optional shared key; when set, requests must send it in the X-Event-Key header
@@ -95,16 +99,60 @@ function readData(src) {
   };
 }
 
+/* ---------- lead log: one row per guest in the Chartwells team's Google Sheet (optional) ----------
+   SHEET_WEBHOOK_URL is the sheet's Apps Script web-app address, SHEET_SECRET the shared key it checks.
+   Logging never blocks or fails the guest's email. */
+const POINTS = { A: 1, B: 3, C: 5 };
+const STAGES = [[15, 'Foundation'], [22, 'Emerging'], [30, 'Developing'], [38, 'Advanced'], [45, 'Future-Ready']];
+function scoreOf(data) {
+  const pts = data.answers.map(k => POINTS[k]);
+  const sum = a => a.reduce((x, y) => x + y, 0), total = sum(pts);
+  return { total, stage: STAGES.find(s => total <= s[0])[1], nutrition: sum(pts.slice(0, 3)), safety: sum(pts.slice(3, 6)), awareness: sum(pts.slice(6, 9)) };
+}
+async function logLead(data, email, phone, status) {
+  const url = process.env.SHEET_WEBHOOK_URL, secret = process.env.SHEET_SECRET;
+  if (!url || !secret) return;
+  const sc = scoreOf(data);
+  // a leading = + - @ would make the sheet run the cell as a formula; prefix such cells with an apostrophe
+  const cell = v => /^[=+\-@]/.test(String(v)) ? "'" + v : v;
+  const row = {
+    secret, time: new Date().toISOString(), name: cell(data.lead.name), email: cell(email), phone: cell(phone),
+    role: cell(data.lead.role), institution: cell(data.lead.institution), variant: data.variant || '',
+    total: sc.total, stage: sc.stage, nutrition: sc.nutrition, safety: sc.safety, awareness: sc.awareness,
+    answers: data.answers.join(''), status
+  };
+  try { await fetch(url, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(row), signal: AbortSignal.timeout(8000) }); }
+  catch (err) { console.error('sheet log failed:', err.message); }
+}
+
+const TEAM = (process.env.REPORT_TEAM_TO || process.env.REPORT_BCC || '').split(',').map(a => a.trim()).filter(a => /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(a)).slice(0, 3);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 function emailHtml(d) {
   const hi = d.lead.name ? 'Dear ' + esc(d.lead.name.split(' ')[0]) + ',' : 'Hello,';
   const who = d.lead.institution ? esc(d.lead.institution) + '’s' : 'your institution’s';
+  const logo = `<img src="${BASE}/img/email-logo-k12.png" width="240" height="47" alt="Chartwells" style="display:block;border:0">`;
   return `<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.55;color:#14181F;max-width:560px">
+<p style="margin:0 0 20px">${logo}</p>
 <p>${hi}</p>
 <p>Thank you for taking the Nutrition Readiness check with Chartwells. Your personal report is attached as a PDF.</p>
 <p>It shows ${who} score across nutrition, food safety, and awareness and sustainability, what is already working, and a game plan for the next 30 days, this term and this year.</p>
-<p>Your Chartwells contact will be in touch to go through it with you. You can also write to us at enquiries@compassgroup-chartwells.co.in or call +91 74284 58309.</p>
+<p>Your Chartwells contact will be in touch to go through it with you. You can also write to us at sarika.chauhan@compass-group.co.in or call +91 96671 80483.</p>
 <p>Warm regards,<br>The Chartwells team<br><span style="color:#5A6170">Chartwells by Compass India · Serving up happy &amp; healthy</span></p>
+</div>`;
+}
+
+// the details email the Chartwells contact gets for each guest (internal; reply goes straight to the guest)
+function teamHtml(d, email, phone, status) {
+  const sc = scoreOf(d);
+  const row = (k, v) => `<tr><td style="padding:6px 12px 6px 0;color:#5A6170;vertical-align:top;width:38%">${k}</td><td style="padding:6px 0;font-weight:bold;vertical-align:top;word-break:break-word">${v || '–'}</td></tr>`;
+  const when = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;color:#14181F;max-width:560px">
+<p style="margin:0 0 4px;font-size:16px;font-weight:bold">New guest at the Nutrition Readiness check</p>
+<p style="margin:0 0 14px;color:#5A6170">${when} IST · their report is attached · reply to this email to write to the guest</p>
+<table style="border-collapse:collapse;font-size:14px;width:100%;table-layout:fixed">
+${row('Name', esc(d.lead.name))}${row('Email', esc(email))}${row('Phone', esc(phone))}${row('Role', esc(d.lead.role))}${row('Institution', esc(d.lead.institution))}${row('Type', d.variant === 'uni' ? 'Higher Ed' : 'K-12')}
+${row('Score', sc.total + ' / 45 · ' + sc.stage + ' stage')}${row('Nutrition', sc.nutrition + ' / 15')}${row('Food Safety', sc.safety + ' / 15')}${row('Awareness &amp; Sustain&shy;ability', sc.awareness + ' / 15')}${row('Report email', status === 'sent' ? 'Sent to the guest' : 'Could not be sent to the guest: please send them this PDF')}
+</table>
 </div>`;
 }
 
@@ -135,15 +183,15 @@ async function graphAccessToken() {
   graphToken = { value: j.access_token, exp: Date.now() + (j.expires_in || 3600) * 1000 };
   return graphToken.value;
 }
-async function sendGraph(to, subject, html, pdf) {
+async function sendGraph(to, subject, html, pdf, replyTo = process.env.REPORT_REPLY_TO) {
   const token = await graphAccessToken();
   const r = await fetch(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(process.env.GRAPH_SENDER)}/sendMail`, {
     method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       message: {
         subject, body: { contentType: 'HTML', content: html },
-        toRecipients: [{ emailAddress: { address: to } }],
-        replyTo: process.env.REPORT_REPLY_TO ? [{ emailAddress: { address: process.env.REPORT_REPLY_TO } }] : [],
+        toRecipients: [].concat(to).map(a => ({ emailAddress: { address: a } })),
+        replyTo: replyTo ? [{ emailAddress: { address: replyTo } }] : [],
         attachments: [{ '@odata.type': '#microsoft.graph.fileAttachment', name: 'Nutrition-Readiness-Report.pdf', contentType: 'application/pdf', contentBytes: pdf.toString('base64') }]
       },
       saveToSentItems: false
@@ -151,10 +199,10 @@ async function sendGraph(to, subject, html, pdf) {
   });
   if (r.status !== 202) { const t = await r.text().catch(() => ''); throw new Error('Graph sendMail ' + r.status + ' ' + t.slice(0, 300)); }
 }
-async function sendResend(to, subject, html, pdf) {
+async function sendResend(to, subject, html, pdf, replyTo = process.env.REPORT_REPLY_TO) {
   const r = await fetch('https://api.resend.com/emails', {
     method: 'POST', headers: { Authorization: 'Bearer ' + process.env.RESEND_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: process.env.REPORT_FROM || 'Chartwells Dining Readiness <onboarding@resend.dev>', to: [to], reply_to: process.env.REPORT_REPLY_TO || undefined, subject, html,
+    body: JSON.stringify({ from: process.env.REPORT_FROM || 'Chartwells Dining Readiness <onboarding@resend.dev>', to: [].concat(to), reply_to: replyTo || undefined, subject, html,
       attachments: [{ filename: 'Nutrition-Readiness-Report.pdf', content: pdf.toString('base64') }] })
   });
   if (!r.ok) { const t = await r.text().catch(() => ''); throw new Error('Resend ' + r.status + ' ' + t.slice(0, 300)); }
@@ -209,8 +257,20 @@ module.exports = async (req, res) => {
     const pdf = await makePdf(data);
     const to = process.env.REPORT_TO_OVERRIDE || email;
     const subject = `${data.lead.name ? data.lead.name.split(' ')[0] + ', your' : 'Your'} Nutrition Readiness Report for ${data.lead.institution || 'your institution'}`;
-    try { await (via === 'graph' ? sendGraph : sendResend)(to, subject, emailHtml(data), pdf); }
-    catch (err) { console.error('send failed:', err.message); return res.status(502).json({ ok: false, error: 'The email could not be sent' }); }
+    const phone = clip(body.lead && body.lead.phone, 30);
+    const send = via === 'graph' ? sendGraph : sendResend;
+    let status = 'sent';
+    try { await send(to, subject, emailHtml(data), pdf); }
+    catch (err) { console.error('send failed:', err.message); status = 'email failed'; }
+    // the Chartwells contact gets the guest's details and report either way, so no guest is lost
+    if (TEAM.length) {
+      const sc = scoreOf(data);
+      const teamSubject = `New guest: ${data.lead.name || email}${data.lead.institution ? ', ' + data.lead.institution : ''} (${sc.total}/45)`;
+      try { await send(TEAM, teamSubject, teamHtml(data, email, phone, status), pdf, email); }
+      catch (err) { console.error('team email failed:', err.message); }
+    }
+    await logLead(data, email, phone, status);
+    if (status !== 'sent') return res.status(502).json({ ok: false, error: 'The email could not be sent' });
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error(err);

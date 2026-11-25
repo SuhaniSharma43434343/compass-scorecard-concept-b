@@ -1022,6 +1022,56 @@
   const variantFor = r => (ROLES[1][1].includes(r) ? 'uni' : 'k12');
   const roleText = r => r;
 
+  /* report email: each finished check goes to /api/report, which prints the guest's PDF and emails it.
+     If the event Wi-Fi drops, the job waits on this device and is sent when the connection is back. */
+  const OUTBOX = 'readiness-outbox';
+  const outbox = () => { try { return JSON.parse(localStorage.getItem(OUTBOX) || '[]'); } catch (err) { return []; } };
+  const saveOutbox = list => { try { localStorage.setItem(OUTBOX, JSON.stringify(list.slice(-50))); } catch (err) { /* storage full or blocked */ } };
+  const postReport = job => fetch('/api/report', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job) })
+    .then(r => r.json().catch(() => ({})).then(j => { if (!j.ok && (r.status >= 500 && r.status !== 503)) throw new Error(j.error || r.status); return j; }));
+  /* local backup: every guest is also kept on this device, whatever happens to the network or email.
+     Open the site with ?backup=1 to download them as a spreadsheet (CSV) or clear them after the event. */
+  const BACKUP = 'readiness-backup';
+  const backup = () => { try { return JSON.parse(localStorage.getItem(BACKUP) || '[]'); } catch (err) { return []; } };
+  const saveBackup = list => { try { localStorage.setItem(BACKUP, JSON.stringify(list.slice(-2000))); } catch (err) { /* storage full or blocked */ } };
+  const markBackup = (id, fields) => saveBackup(backup().map(r => r.id === id ? Object.assign(r, fields) : r));
+  function sendReport(rec) {
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    rec.backupId = id;
+    saveBackup(backup().concat({ id, time: rec.submittedAt, name: rec.lead.name, email: rec.lead.email, phone: rec.lead.phone, role: rec.lead.role,
+      institution: rec.lead.institution, total: rec.total, stage: rec.stage, answers: answers.join(''), email_status: 'sending', note: '' }));
+    const job = { id, answers: answers.slice(), lead: { name: rec.lead.name, email: rec.lead.email, phone: rec.lead.phone, role: rec.lead.role, institution: rec.lead.institution }, variant: variantFor(rec.lead.role), consent: true };
+    postReport(job).then(j => markBackup(id, { email_status: j.ok ? 'sent' : 'not sent: ' + (j.error || '') }))
+      .catch(() => { markBackup(id, { email_status: 'waiting for internet' }); saveOutbox(outbox().concat(job)); });
+  }
+  function flushOutbox() {
+    const list = outbox(); if (!list.length || navigator.onLine === false) return;
+    saveOutbox([]);
+    list.forEach(job => postReport(job).then(j => markBackup(job.id, { email_status: j.ok ? 'sent (after retry)' : 'not sent: ' + (j.error || '') }))
+      .catch(() => saveOutbox(outbox().concat(job))));
+  }
+  function backupScreen() {
+    const cols = ['time', 'name', 'email', 'phone', 'role', 'institution', 'total', 'stage', 'answers', 'email_status', 'note'];
+    const csvCell = v => { let t = String(v == null ? '' : v); if (/^[=+\-@]/.test(t)) t = "'" + t; return '"' + t.replace(/"/g, '""') + '"'; };
+    const info = h('p', { className: 'note' });
+    const refresh = () => { const l = backup(); info.textContent = l.length + ' guest' + (l.length === 1 ? '' : 's') + ' saved on this device · ' + outbox().length + ' email(s) waiting for internet'; };
+    const dl = h('button', { className: 'btn', type: 'button', textContent: 'Download backup (CSV)' });
+    dl.onclick = () => {
+      const rows = [cols.join(',')].concat(backup().map(r => cols.map(c => csvCell(r[c])).join(',')));
+      const a = h('a', { href: URL.createObjectURL(new Blob(['\ufeff' + rows.join('\r\n')], { type: 'text/csv' })), download: 'chartwells-guests-' + new Date().toLocaleDateString('en-CA') + '.csv' });
+      document.body.append(a); a.click(); a.remove();
+    };
+    const retry = h('button', { className: 'link', type: 'button', textContent: 'Retry waiting emails now' });
+    retry.onclick = () => { flushOutbox(); setTimeout(refresh, 4000); };
+    const clear = h('button', { className: 'link', type: 'button', textContent: 'Clear backup from this device' });
+    clear.onclick = () => { if (confirm('Delete all saved guests from this device? Download the CSV first.')) { saveBackup([]); refresh(); } };
+    refresh();
+    show([h('p', { className: 'eyebrow', textContent: 'For the Chartwells team' }), h('h2', { textContent: 'Guest backup on this device' }), info,
+      h('div', { className: 'res-actions' }, [dl, retry, clear])]);
+  }
+  window.addEventListener('online', flushOutbox);
+  setTimeout(flushOutbox, 3000);
+
   /* ================= screens ================= */
   function intro() {
     clearTimers();
@@ -1337,6 +1387,7 @@
     const cards = Q.pillars.map((p, n) => { const sc = Q.pillarScore(answers, n), b = Q.band(sc);
       return h('div', { className: 'pcard ' + b.id }, [h('small', { textContent: p.name }), h('b', {}, [String(sc), h('span', { textContent: ' / 15' })]), h('em', { textContent: b.word })]); });
     const rec = Q.record(answers, lead);
+    sendReport(rec);
     console.log('Backend record (prototype):', rec);
     const next = h('button', { className: 'link next-guest', type: 'button', textContent: 'Start again for the next guest' });
     next.onclick = newGuest;
@@ -1464,7 +1515,7 @@
     const notes = h('textarea', { placeholder: 'Interests, questions, follow-up…', value: rec.sellerNote || '' });
     const saved = h('p', { className: 'note' });
     const nf = h('form', {}, [h('label', {}, ['Notes', notes]), h('div', {}, [h('button', { className: 'btn', type: 'submit', textContent: 'Save note' })]), saved]);
-    nf.onsubmit = e => { e.preventDefault(); rec.sellerNote = notes.value.trim(); console.log('Backend record (prototype):', rec); saved.textContent = 'Note saved to this guest’s record (prototype: not stored anywhere yet).'; };
+    nf.onsubmit = e => { e.preventDefault(); rec.sellerNote = notes.value.trim(); if (rec.backupId) markBackup(rec.backupId, { note: rec.sellerNote }); console.log('Backend record (prototype):', rec); saved.textContent = 'Note saved to this guest’s record (prototype: not stored anywhere yet).'; };
     const back = h('button', { className: 'link', type: 'button', textContent: '← Back to the scorecard' });
     back.onclick = () => screen.replaceChildren(...resultNodes);
     const next = h('button', { className: 'link next-guest', type: 'button', textContent: 'Start again for the next guest' });
@@ -1478,7 +1529,7 @@
     ]);
   }
 
-  WHY_MODE === '2' ? attract() : LISA ? meet() : intro();
+  QS.get('backup') === '1' ? backupScreen() : WHY_MODE === '2' ? attract() : LISA ? meet() : intro();
   resetIdle();
 })();
 </script>
